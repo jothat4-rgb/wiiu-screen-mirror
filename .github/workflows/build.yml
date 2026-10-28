@@ -1,0 +1,34 @@
+
+name: Build Wii U Screen Mirror
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+
+    steps:
+      - name: Get project files
+        uses: actions/checkout@v4
+
+      - name: Configure Wii U build
+        run: /opt/devkitpro/portlibs/wiiu/bin/powerpc-eabi-cmake -B build
+
+      - name: Compile app
+        run: cmake --build build
+
+      - name: Package WUHB
+        run: |
+          mkdir -p output
+          wuhbtool build/ScreenMirror.rpx output/ScreenMirror.wuhb --name="Screen Mirror" --short-name="ScreenMirror" --author="jothat4-rgb"
+
+      - name: Save compiled files
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen-mirror-build
+          path: |
+            build/
+            output/
