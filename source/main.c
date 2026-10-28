@@ -6,8 +6,6 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -31,7 +29,6 @@ typedef struct {
     size_t length;
 } StreamReader;
 
-/* Read buffered network data without losing bytes between reads. */
 static ssize_t stream_read(StreamReader *reader,
                            uint8_t *output, size_t wanted)
 {
@@ -70,7 +67,6 @@ static ssize_t stream_read(StreamReader *reader,
     return (ssize_t)copied;
 }
 
-/* Read one HTTP/MIME header line and remove CR/LF. */
 static bool stream_read_line(StreamReader *reader,
                              char *line, size_t capacity)
 {
@@ -104,20 +100,12 @@ static bool stream_read_exact(StreamReader *reader,
     return stream_read(reader, data, size) == (ssize_t)size;
 }
 
-/* Connect to ScreenStream and request its continuous MJPEG stream. */
 static int connect_to_phone(void)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
 
     if (sock < 0)
         return -1;
-
-    struct timeval timeout;
-    timeout.tv_sec = 3;
-    timeout.tv_usec = 0;
-
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-               &timeout, sizeof(timeout));
 
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
@@ -163,7 +151,6 @@ static int connect_to_phone(void)
     return sock;
 }
 
-/* Read the initial HTTP response headers. */
 static bool read_http_headers(StreamReader *reader)
 {
     char line[LINE_SIZE];
@@ -184,11 +171,6 @@ static bool read_http_headers(StreamReader *reader)
     return false;
 }
 
-/*
- * Read one complete multipart JPEG frame.
- * Frame boundaries come from MIME headers and Content-Length,
- * not guesses based on JPEG marker bytes.
- */
 static bool read_mjpeg_frame(StreamReader *reader,
                              uint8_t *frame,
                              size_t frame_capacity,
@@ -196,18 +178,17 @@ static bool read_mjpeg_frame(StreamReader *reader,
 {
     char line[LINE_SIZE];
 
+    /* Find the next multipart boundary. */
     for (;;) {
         if (!stream_read_line(reader, line, sizeof(line)))
             return false;
 
-        /* Skip blank lines and seek the next MIME boundary. */
         if (line[0] == '\0')
             continue;
 
         if (line[0] != '-' || line[1] != '-')
             continue;
 
-        /* A final MIME boundary means the stream has ended. */
         if (line[2] == '-' && line[3] == '-')
             return false;
 
@@ -216,7 +197,7 @@ static bool read_mjpeg_frame(StreamReader *reader,
 
     size_t content_length = 0;
 
-    /* Read this frame's MIME headers. */
+    /* Read the headers belonging to this JPEG frame. */
     for (;;) {
         if (!stream_read_line(reader, line, sizeof(line)))
             return false;
@@ -242,7 +223,7 @@ static bool read_mjpeg_frame(StreamReader *reader,
         }
     }
 
-    /* Do not guess frame boundaries if the length is missing. */
+    /* Do not guess frame boundaries if length is missing. */
     if (content_length == 0)
         return false;
 
@@ -410,6 +391,38 @@ int main(int argc, char **argv)
 
                     SDL_FreeSurface(converted);
                 }
+            }
+        }
+
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        if (texture) {
+            SDL_Rect destination = {
+                0, 0, SCREEN_W, SCREEN_H
+            };
+
+            SDL_RenderCopy(
+                renderer, texture, NULL, &destination);
+        }
+
+        SDL_RenderPresent(renderer);
+    }
+
+    if (sock >= 0)
+        close(sock);
+
+    if (texture)
+        SDL_DestroyTexture(texture);
+
+    free(frame);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    IMG_Quit();
+    SDL_Quit();
+
+    return 0;
+}   }
             }
         }
 
