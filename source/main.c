@@ -12,14 +12,18 @@
 
 #include <SDL.h>
 #include <SDL_image.h>
+#include <vpad/input.h>
 
 #define PHONE_IP "10.178.61.104"
 #define PHONE_PORT 8080
 #define STREAM_PATH "/stream.mjpeg?clientId=ScreenMirrorWiiU"
 
 #define FRAME_MAX (2 * 1024 * 1024)
-#define SCREEN_W 854
-#define SCREEN_H 480
+#define FALLBACK_W 854
+#define FALLBACK_H 480
+#define RESIZE_STEP 16
+#define MIN_IMAGE_SIZE 80
+#define RESIZE_INTERVAL 100
 
 static int connect_to_phone(void)
 {
@@ -37,12 +41,14 @@ static int connect_to_phone(void)
         return -1;
     }
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (connect(sock, (struct sockaddr *)&addr,
+                sizeof(addr)) < 0) {
         close(sock);
         return -1;
     }
 
     char request[512];
+
     snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
@@ -54,7 +60,8 @@ static int connect_to_phone(void)
     size_t length = strlen(request);
 
     while (sent < length) {
-        ssize_t n = send(sock, request + sent, length - sent, 0);
+        ssize_t n = send(sock, request + sent,
+                         length - sent, 0);
         if (n <= 0) {
             close(sock);
             return -1;
@@ -63,6 +70,17 @@ static int connect_to_phone(void)
     }
 
     return sock;
+}
+
+static int clamp_size(int value, int maximum)
+{
+    if (value < MIN_IMAGE_SIZE)
+        return MIN_IMAGE_SIZE;
+
+    if (value > maximum)
+        return maximum;
+
+    return value;
 }
 
 int main(int argc, char **argv)
@@ -74,26 +92,47 @@ int main(int argc, char **argv)
 
     SDL_Window *window = SDL_CreateWindow(
         "Screen Mirror",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        SCREEN_W,
-        SCREEN_H,
-        SDL_WINDOW_FULLSCREEN
+        SDL_WINDOWPOS_UNDEFINED,
+        SDL_WINDOWPOS_UNDEFINED,
+        0,
+        0,
+        SDL_WINDOW_FULLSCREEN_DESKTOP
     );
 
     if (!window) {
+        IMG_Quit();
         SDL_Quit();
         return 1;
     }
 
     SDL_Renderer *renderer =
-        SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        SDL_CreateRenderer(
+            window, -1, SDL_RENDERER_ACCELERATED);
 
     if (!renderer) {
         SDL_DestroyWindow(window);
+        IMG_Quit();
         SDL_Quit();
         return 1;
     }
+
+    int screen_w = FALLBACK_W;
+    int screen_h = FALLBACK_H;
+
+    int output_w = 0;
+    int output_h = 0;
+
+    if (SDL_GetRendererOutputSize(
+            renderer, &output_w, &output_h) == 0 &&
+        output_w >= 320 && output_h >= 200) {
+        screen_w = output_w;
+        screen_h = output_h;
+    }
+
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+
+    int image_w = screen_w;
+    int image_h = screen_h;
 
     SDL_Texture *texture = NULL;
     uint8_t *frame = malloc(FRAME_MAX);
@@ -101,6 +140,7 @@ int main(int argc, char **argv)
     if (!frame) {
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
+        IMG_Quit();
         SDL_Quit();
         return 1;
     }
@@ -109,19 +149,74 @@ int main(int argc, char **argv)
     size_t frame_size = 0;
     bool in_frame = false;
     bool running = true;
-    bool connected = false;
     uint8_t previous = 0;
+
+    uint32_t last_resize_time = 0;
 
     while (running) {
         SDL_Event event;
+
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT)
                 running = false;
         }
 
+        /*
+         * Resize only while BOTH L and R are held.
+         * Releasing either button immediately disables
+         * the resizing controls.
+         */
+        VPADStatus vpad;
+        int32_t vpad_error = 0;
+
+        VPADRead(VPAD_CHAN_0, &vpad, 1, &vpad_error);
+
+        bool l_held = (vpad.hold & VPAD_BUTTON_L) != 0;
+        bool r_held = (vpad.hold & VPAD_BUTTON_R) != 0;
+        bool resize_mode = l_held && r_held;
+
+        uint32_t now = SDL_GetTicks();
+
+        if (resize_mode &&
+            (now - last_resize_time >= RESIZE_INTERVAL)) {
+
+            bool changed = false;
+
+            if (vpad.hold & VPAD_BUTTON_LEFT) {
+                image_w -= RESIZE_STEP;
+                changed = true;
+            }
+
+            if (vpad.hold & VPAD_BUTTON_RIGHT) {
+                image_w += RESIZE_STEP;
+                changed = true;
+            }
+
+            if (vpad.hold & VPAD_BUTTON_UP) {
+                image_h += RESIZE_STEP;
+                changed = true;
+            }
+
+            if (vpad.hold & VPAD_BUTTON_DOWN) {
+                image_h -= RESIZE_STEP;
+                changed = true;
+            }
+
+            if (vpad.hold & VPAD_BUTTON_A) {
+                image_w = screen_w;
+                image_h = screen_h;
+                changed = true;
+            }
+
+            image_w = clamp_size(image_w, screen_w);
+            image_h = clamp_size(image_h, screen_h);
+
+            if (changed)
+                last_resize_time = now;
+        }
+
         if (sock < 0) {
             sock = connect_to_phone();
-            connected = (sock >= 0);
             SDL_Delay(1000);
         }
 
@@ -131,24 +226,29 @@ int main(int argc, char **argv)
             FD_SET(sock, &readfds);
 
             struct timeval timeout = {0, 20000};
-            int ready = select(sock + 1, &readfds, NULL, NULL, &timeout);
+
+            int ready = select(
+                sock + 1, &readfds, NULL, NULL, &timeout);
 
             if (ready > 0 && FD_ISSET(sock, &readfds)) {
                 uint8_t data[8192];
-                ssize_t count = recv(sock, data, sizeof(data), 0);
+
+                ssize_t count = recv(
+                    sock, data, sizeof(data), 0);
 
                 if (count <= 0) {
                     close(sock);
                     sock = -1;
-                    connected = false;
                     in_frame = false;
                     frame_size = 0;
+                    previous = 0;
                 } else {
                     for (ssize_t i = 0; i < count; i++) {
                         uint8_t byte = data[i];
 
                         if (!in_frame) {
-                            if (previous == 0xFF && byte == 0xD8) {
+                            if (previous == 0xFF &&
+                                byte == 0xD8) {
                                 in_frame = true;
                                 frame_size = 0;
                                 frame[frame_size++] = 0xFF;
@@ -157,9 +257,11 @@ int main(int argc, char **argv)
                         } else if (frame_size < FRAME_MAX) {
                             frame[frame_size++] = byte;
 
-                            if (previous == 0xFF && byte == 0xD9) {
-                                SDL_RWops *rw = SDL_RWFromConstMem(
-                                    frame, (int)frame_size);
+                            if (previous == 0xFF &&
+                                byte == 0xD9) {
+                                SDL_RWops *rw =
+                                    SDL_RWFromConstMem(
+                                        frame, (int)frame_size);
 
                                 if (rw) {
                                     SDL_Surface *image =
@@ -172,7 +274,9 @@ int main(int argc, char **argv)
 
                                         if (new_texture) {
                                             if (texture)
-                                                SDL_DestroyTexture(texture);
+                                                SDL_DestroyTexture(
+                                                    texture);
+
                                             texture = new_texture;
                                         }
 
@@ -198,11 +302,15 @@ int main(int argc, char **argv)
         SDL_RenderClear(renderer);
 
         if (texture) {
-            SDL_Rect destination = {0, 0, SCREEN_W, SCREEN_H};
-            SDL_RenderCopy(renderer, texture, NULL, &destination);
-        } else {
-            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-            SDL_RenderClear(renderer);
+            SDL_Rect destination = {
+                (screen_w - image_w) / 2,
+                (screen_h - image_h) / 2,
+                image_w,
+                image_h
+            };
+
+            SDL_RenderCopy(
+                renderer, texture, NULL, &destination);
         }
 
         SDL_RenderPresent(renderer);
