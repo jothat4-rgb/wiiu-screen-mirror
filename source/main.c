@@ -1,48 +1,137 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <errno.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #include <SDL.h>
 #include <SDL_image.h>
-#include <vpad/input.h>
 
-#define PHONE_IP "10.178.61.104"
+#define PHONE_IP "REPLACE_WITH_YOUR_PHONE_IP"
 #define PHONE_PORT 8080
 #define STREAM_PATH "/stream.mjpeg?clientId=ScreenMirrorWiiU"
 
+#define SCREEN_W 854
+#define SCREEN_H 480
 #define FRAME_MAX (2 * 1024 * 1024)
-#define FALLBACK_W 854
-#define FALLBACK_H 480
-#define RESIZE_STEP 16
-#define MIN_IMAGE_SIZE 80
-#define RESIZE_INTERVAL 100
+#define NET_BUFFER_SIZE 16384
+#define LINE_SIZE 1024
 
+typedef struct {
+    int socket_fd;
+    uint8_t data[NET_BUFFER_SIZE];
+    size_t position;
+    size_t length;
+} StreamReader;
+
+/* Read buffered network data without losing bytes between reads. */
+static ssize_t stream_read(StreamReader *reader,
+                           uint8_t *output, size_t wanted)
+{
+    size_t copied = 0;
+
+    while (copied < wanted) {
+        if (reader->position >= reader->length) {
+            ssize_t received = recv(
+                reader->socket_fd,
+                reader->data,
+                sizeof(reader->data),
+                0
+            );
+
+            if (received <= 0)
+                return copied ? (ssize_t)copied : -1;
+
+            reader->position = 0;
+            reader->length = (size_t)received;
+        }
+
+        size_t available = reader->length - reader->position;
+        size_t amount = wanted - copied;
+
+        if (amount > available)
+            amount = available;
+
+        memcpy(output + copied,
+               reader->data + reader->position,
+               amount);
+
+        reader->position += amount;
+        copied += amount;
+    }
+
+    return (ssize_t)copied;
+}
+
+/* Read one HTTP/MIME header line and remove CR/LF. */
+static bool stream_read_line(StreamReader *reader,
+                             char *line, size_t capacity)
+{
+    size_t used = 0;
+
+    while (used + 1 < capacity) {
+        uint8_t ch;
+
+        if (stream_read(reader, &ch, 1) != 1)
+            return false;
+
+        if (ch == '\n') {
+            line[used] = '\0';
+
+            if (used > 0 && line[used - 1] == '\r')
+                line[used - 1] = '\0';
+
+            return true;
+        }
+
+        line[used++] = (char)ch;
+    }
+
+    line[used] = '\0';
+    return false;
+}
+
+static bool stream_read_exact(StreamReader *reader,
+                              uint8_t *data, size_t size)
+{
+    return stream_read(reader, data, size) == (ssize_t)size;
+}
+
+/* Connect to ScreenStream and request its continuous MJPEG stream. */
 static int connect_to_phone(void)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
+
     if (sock < 0)
         return -1;
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PHONE_PORT);
+    struct timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
 
-    if (inet_pton(AF_INET, PHONE_IP, &addr.sin_addr) != 1) {
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               &timeout, sizeof(timeout));
+
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+
+    address.sin_family = AF_INET;
+    address.sin_port = htons(PHONE_PORT);
+
+    if (inet_pton(AF_INET, PHONE_IP, &address.sin_addr) != 1) {
         close(sock);
         return -1;
     }
 
-    if (connect(sock, (struct sockaddr *)&addr,
-                sizeof(addr)) < 0) {
+    if (connect(sock, (struct sockaddr *)&address,
+                sizeof(address)) < 0) {
         close(sock);
         return -1;
     }
@@ -52,51 +141,138 @@ static int connect_to_phone(void)
     snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "Accept: multipart/x-mixed-replace\r\n\r\n",
         STREAM_PATH, PHONE_IP, PHONE_PORT);
 
-    size_t sent = 0;
     size_t length = strlen(request);
+    size_t sent = 0;
 
     while (sent < length) {
-        ssize_t n = send(sock, request + sent,
-                         length - sent, 0);
-        if (n <= 0) {
+        ssize_t amount = send(
+            sock, request + sent, length - sent, 0);
+
+        if (amount <= 0) {
             close(sock);
             return -1;
         }
-        sent += (size_t)n;
+
+        sent += (size_t)amount;
     }
 
     return sock;
 }
 
-static int clamp_size(int value, int maximum)
+/* Read the initial HTTP response headers. */
+static bool read_http_headers(StreamReader *reader)
 {
-    if (value < MIN_IMAGE_SIZE)
-        return MIN_IMAGE_SIZE;
+    char line[LINE_SIZE];
 
-    if (value > maximum)
-        return maximum;
+    if (!stream_read_line(reader, line, sizeof(line)))
+        return false;
 
-    return value;
+    if (strncmp(line, "HTTP/", 5) != 0 ||
+        strstr(line, " 200 ") == NULL) {
+        return false;
+    }
+
+    while (stream_read_line(reader, line, sizeof(line))) {
+        if (line[0] == '\0')
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * Read one complete multipart JPEG frame.
+ * Frame boundaries come from MIME headers and Content-Length,
+ * not guesses based on JPEG marker bytes.
+ */
+static bool read_mjpeg_frame(StreamReader *reader,
+                             uint8_t *frame,
+                             size_t frame_capacity,
+                             size_t *frame_size)
+{
+    char line[LINE_SIZE];
+
+    for (;;) {
+        if (!stream_read_line(reader, line, sizeof(line)))
+            return false;
+
+        /* Skip blank lines and seek the next MIME boundary. */
+        if (line[0] == '\0')
+            continue;
+
+        if (line[0] != '-' || line[1] != '-')
+            continue;
+
+        /* A final MIME boundary means the stream has ended. */
+        if (line[2] == '-' && line[3] == '-')
+            return false;
+
+        break;
+    }
+
+    size_t content_length = 0;
+
+    /* Read this frame's MIME headers. */
+    for (;;) {
+        if (!stream_read_line(reader, line, sizeof(line)))
+            return false;
+
+        if (line[0] == '\0')
+            break;
+
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            char *value = line + 15;
+
+            while (*value == ' ' || *value == '\t')
+                value++;
+
+            char *end = NULL;
+            unsigned long parsed = strtoul(value, &end, 10);
+
+            if (end == value || parsed == 0 ||
+                parsed > frame_capacity) {
+                return false;
+            }
+
+            content_length = (size_t)parsed;
+        }
+    }
+
+    /* Do not guess frame boundaries if the length is missing. */
+    if (content_length == 0)
+        return false;
+
+    if (!stream_read_exact(reader, frame, content_length))
+        return false;
+
+    *frame_size = content_length;
+    return true;
 }
 
 int main(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     if (SDL_Init(SDL_INIT_VIDEO) < 0)
         return 1;
 
-    IMG_Init(IMG_INIT_JPG);
+    if ((IMG_Init(IMG_INIT_JPG) & IMG_INIT_JPG) == 0) {
+        SDL_Quit();
+        return 1;
+    }
 
     SDL_Window *window = SDL_CreateWindow(
         "Screen Mirror",
-        SDL_WINDOWPOS_UNDEFINED,
-        SDL_WINDOWPOS_UNDEFINED,
-        0,
-        0,
-        SDL_WINDOW_FULLSCREEN_DESKTOP
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        SCREEN_W,
+        SCREEN_H,
+        SDL_WINDOW_FULLSCREEN
     );
 
     if (!window) {
@@ -105,9 +281,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    SDL_Renderer *renderer =
-        SDL_CreateRenderer(
-            window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Renderer *renderer = SDL_CreateRenderer(
+        window, -1, SDL_RENDERER_ACCELERATED);
 
     if (!renderer) {
         SDL_DestroyWindow(window);
@@ -116,25 +291,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int screen_w = FALLBACK_W;
-    int screen_h = FALLBACK_H;
-
-    int output_w = 0;
-    int output_h = 0;
-
-    if (SDL_GetRendererOutputSize(
-            renderer, &output_w, &output_h) == 0 &&
-        output_w >= 320 && output_h >= 200) {
-        screen_w = output_w;
-        screen_h = output_h;
-    }
-
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 
-    int image_w = screen_w;
-    int image_h = screen_h;
-
     SDL_Texture *texture = NULL;
+    int texture_w = 0;
+    int texture_h = 0;
+
     uint8_t *frame = malloc(FRAME_MAX);
 
     if (!frame) {
@@ -146,12 +308,11 @@ int main(int argc, char **argv)
     }
 
     int sock = -1;
-    size_t frame_size = 0;
-    bool in_frame = false;
     bool running = true;
-    uint8_t previous = 0;
 
-    uint32_t last_resize_time = 0;
+    StreamReader reader;
+    memset(&reader, 0, sizeof(reader));
+    reader.socket_fd = -1;
 
     while (running) {
         SDL_Event event;
@@ -161,139 +322,93 @@ int main(int argc, char **argv)
                 running = false;
         }
 
-        /*
-         * Resize only while BOTH L and R are held.
-         * Releasing either button immediately disables
-         * the resizing controls.
-         */
-        VPADStatus vpad;
-        int32_t vpad_error = 0;
-
-        VPADRead(VPAD_CHAN_0, &vpad, 1, &vpad_error);
-
-        bool l_held = (vpad.hold & VPAD_BUTTON_L) != 0;
-        bool r_held = (vpad.hold & VPAD_BUTTON_R) != 0;
-        bool resize_mode = l_held && r_held;
-
-        uint32_t now = SDL_GetTicks();
-
-        if (resize_mode &&
-            (now - last_resize_time >= RESIZE_INTERVAL)) {
-
-            bool changed = false;
-
-            if (vpad.hold & VPAD_BUTTON_LEFT) {
-                image_w -= RESIZE_STEP;
-                changed = true;
-            }
-
-            if (vpad.hold & VPAD_BUTTON_RIGHT) {
-                image_w += RESIZE_STEP;
-                changed = true;
-            }
-
-            if (vpad.hold & VPAD_BUTTON_UP) {
-                image_h += RESIZE_STEP;
-                changed = true;
-            }
-
-            if (vpad.hold & VPAD_BUTTON_DOWN) {
-                image_h -= RESIZE_STEP;
-                changed = true;
-            }
-
-            if (vpad.hold & VPAD_BUTTON_A) {
-                image_w = screen_w;
-                image_h = screen_h;
-                changed = true;
-            }
-
-            image_w = clamp_size(image_w, screen_w);
-            image_h = clamp_size(image_h, screen_h);
-
-            if (changed)
-                last_resize_time = now;
-        }
+        if (!running)
+            break;
 
         if (sock < 0) {
             sock = connect_to_phone();
-            SDL_Delay(1000);
-        }
 
-        if (sock >= 0) {
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(sock, &readfds);
+            if (sock >= 0) {
+                reader.socket_fd = sock;
+                reader.position = 0;
+                reader.length = 0;
 
-            struct timeval timeout = {0, 20000};
-
-            int ready = select(
-                sock + 1, &readfds, NULL, NULL, &timeout);
-
-            if (ready > 0 && FD_ISSET(sock, &readfds)) {
-                uint8_t data[8192];
-
-                ssize_t count = recv(
-                    sock, data, sizeof(data), 0);
-
-                if (count <= 0) {
+                if (!read_http_headers(&reader)) {
                     close(sock);
                     sock = -1;
-                    in_frame = false;
-                    frame_size = 0;
-                    previous = 0;
-                } else {
-                    for (ssize_t i = 0; i < count; i++) {
-                        uint8_t byte = data[i];
+                    reader.socket_fd = -1;
+                }
+            }
 
-                        if (!in_frame) {
-                            if (previous == 0xFF &&
-                                byte == 0xD8) {
-                                in_frame = true;
-                                frame_size = 0;
-                                frame[frame_size++] = 0xFF;
-                                frame[frame_size++] = 0xD8;
-                            }
-                        } else if (frame_size < FRAME_MAX) {
-                            frame[frame_size++] = byte;
+            if (sock < 0) {
+                SDL_Delay(500);
+                continue;
+            }
+        }
 
-                            if (previous == 0xFF &&
-                                byte == 0xD9) {
-                                SDL_RWops *rw =
-                                    SDL_RWFromConstMem(
-                                        frame, (int)frame_size);
+        size_t frame_size = 0;
 
-                                if (rw) {
-                                    SDL_Surface *image =
-                                        IMG_Load_RW(rw, 1);
+        if (!read_mjpeg_frame(
+                &reader, frame, FRAME_MAX, &frame_size)) {
+            close(sock);
+            sock = -1;
+            reader.socket_fd = -1;
+            reader.position = 0;
+            reader.length = 0;
+            SDL_Delay(250);
+            continue;
+        }
 
-                                    if (image) {
-                                        SDL_Texture *new_texture =
-                                            SDL_CreateTextureFromSurface(
-                                                renderer, image);
+        SDL_RWops *rw = SDL_RWFromConstMem(
+            frame, (int)frame_size);
 
-                                        if (new_texture) {
-                                            if (texture)
-                                                SDL_DestroyTexture(
-                                                    texture);
+        if (rw) {
+            SDL_Surface *image = IMG_Load_RW(rw, 1);
 
-                                            texture = new_texture;
-                                        }
+            if (image) {
+                SDL_Surface *converted = SDL_ConvertSurfaceFormat(
+                    image, SDL_PIXELFORMAT_ARGB8888, 0);
 
-                                        SDL_FreeSurface(image);
-                                    }
-                                }
+                SDL_FreeSurface(image);
 
-                                in_frame = false;
-                                frame_size = 0;
-                            }
+                if (converted) {
+                    if (!texture ||
+                        texture_w != converted->w ||
+                        texture_h != converted->h) {
+
+                        if (texture)
+                            SDL_DestroyTexture(texture);
+
+                        texture = SDL_CreateTexture(
+                            renderer,
+                            SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING,
+                            converted->w,
+                            converted->h
+                        );
+
+                        if (texture) {
+                            texture_w = converted->w;
+                            texture_h = converted->h;
+
+                            SDL_SetTextureBlendMode(
+                                texture, SDL_BLENDMODE_NONE);
                         } else {
-                            in_frame = false;
-                            frame_size = 0;
+                            texture_w = 0;
+                            texture_h = 0;
                         }
-
-                        previous = byte;
                     }
+
+                    if (texture) {
+                        SDL_UpdateTexture(
+                            texture,
+                            NULL,
+                            converted->pixels,
+                            converted->pitch
+                        );
+                    }
+
+                    SDL_FreeSurface(converted);
                 }
             }
         }
@@ -303,10 +418,7 @@ int main(int argc, char **argv)
 
         if (texture) {
             SDL_Rect destination = {
-                (screen_w - image_w) / 2,
-                (screen_h - image_h) / 2,
-                image_w,
-                image_h
+                0, 0, SCREEN_W, SCREEN_H
             };
 
             SDL_RenderCopy(
@@ -314,7 +426,6 @@ int main(int argc, char **argv)
         }
 
         SDL_RenderPresent(renderer);
-        SDL_Delay(1);
     }
 
     if (sock >= 0)
