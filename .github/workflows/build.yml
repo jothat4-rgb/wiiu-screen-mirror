@@ -1,4 +1,3 @@
-
 name: Build Wii U Screen Mirror
 
 on:
@@ -13,6 +12,11 @@ jobs:
     steps:
       - name: Get project files
         uses: actions/checkout@v4
+
+      - name: Install Wii U image libraries
+        run: |
+          dkp-pacman -Sy --noconfirm
+          dkp-pacman -S --needed --noconfirm wiiu-sdl2_image
 
       - name: Configure Wii U build
         run: /opt/devkitpro/portlibs/wiiu/bin/powerpc-eabi-cmake -B build
